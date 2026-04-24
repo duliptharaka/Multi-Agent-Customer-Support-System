@@ -11,6 +11,10 @@
 [![LiteLLM](https://img.shields.io/badge/LiteLLM-wrapper-FF5A5F)](https://docs.litellm.ai/)
 [![OpenAI](https://img.shields.io/badge/OpenAI-LLM-412991?logo=openai&logoColor=white)](https://openai.com/)
 [![Starlette](https://img.shields.io/badge/Starlette-Uvicorn-2C3E50)](https://www.starlette.io/)
+[![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Vite](https://img.shields.io/badge/Vite-5-646CFF?logo=vite&logoColor=white)](https://vitejs.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-A31F34)](./LICENSE)
 
 </div>
 
@@ -25,7 +29,7 @@
 | **Tickets** | `ticket_agent` — existing tickets + triage of new complaints. **Read-only Supabase via MCP**. |
 | **Returns** | `returns_agent` — **`RemoteA2aAgent`** pointing at a standalone service that can **write** (refund ticket + flip `orders.status='returned'`). |
 | **FAQ** | `faq_agent` — shipping / returns / warranty policy text. **No database**. |
-| **Data** | Supabase with `customers`, `orders`, `support_tickets` (15 seeded rows each; see `Backend/database/`). |
+| **Data** | Live Supabase project with `customers`, `orders`, `support_tickets` (15 rows each). |
 | **Protocols** | **MCP** over stdio for read path; **A2A** over HTTP/JSON-RPC for the remote Returns specialist. |
 
 ---
@@ -39,7 +43,7 @@
   Writes       ·  Separate A2A service using Supabase Management API
   Safety       ·  Atomic CTE: INSERT ticket + UPDATE order in one SQL
   Idempotency  ·  check_return_eligibility refuses already-returned
-  Testing      ·  Single-command end-to-end: MCP + A2A + escalation
+  UI           ·  React + TS chat; live agent-transfer & tool-call trace
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,8 +100,8 @@ flowchart LR
 | `Backend/returns_service/tools.py` | `check_return_eligibility`, `initiate_return`. |
 | `Backend/returns_service/db.py` | `httpx` client for Supabase's Management API SQL endpoint. |
 | `Backend/returns_service/server.py` | `to_a2a(returns_agent)` + uvicorn entrypoint. |
-| `Backend/database/schema.sql` | Tables + 45 seeded rows; see `Backend/database/README.md`. |
-| `Backend/tests/scenarios.py` | End-to-end harness (billing / returns / escalation). |
+| `Frontend/src/App.tsx` | Chat layout, trace panel, suggestion buttons. |
+| `Frontend/src/api.ts` | Thin ADK client (create session, stream `run_sse`). |
 | `requirements.txt` | Python dependencies (ADK, LiteLLM, a2a-sdk, httpx, dotenv). |
 
 ```
@@ -113,19 +117,25 @@ Multi-Agent Customer Support System/
 │   │   │   └── returns_agent.py
 │   │   └── tools/
 │   │       └── supabase_mcp.py
-│   ├── returns_service/
-│   │   ├── agent.py
-│   │   ├── tools.py
-│   │   ├── db.py
-│   │   └── server.py
-│   ├── database/
-│   │   ├── schema.sql
-│   │   └── README.md
-│   └── tests/
-│       └── scenarios.py
-├── Frontend/             (Step 5, placeholder)
+│   └── returns_service/
+│       ├── agent.py
+│       ├── tools.py
+│       ├── db.py
+│       └── server.py
+├── Frontend/
+│   ├── src/
+│   │   ├── App.tsx
+│   │   ├── api.ts
+│   │   ├── types.ts
+│   │   ├── styles.css
+│   │   └── main.tsx
+│   ├── index.html
+│   ├── vite.config.ts
+│   ├── tsconfig.json
+│   └── package.json
 ├── requirements.txt
 ├── .env                  (git-ignored)
+├── LICENSE
 └── README.md
 ```
 
@@ -136,7 +146,7 @@ Multi-Agent Customer Support System/
 - **Python** 3.13 (3.10+ usually works; 3.14 lacks wheels for some deps).
 - **Node.js** 18+ and `npx` on `PATH` (ADK launches the Supabase MCP server via `npx`).
 - **OpenAI API key** and a model id (e.g. `gpt-4o-mini`).
-- **Supabase project** with `Backend/database/schema.sql` applied.
+- **Supabase project** containing `customers`, `orders`, `support_tickets` (see the schema expected below).
 
 ---
 
@@ -167,9 +177,50 @@ All secrets live in a **single `.env` at the repo root** (git-ignored). The main
 
 ## Local setup
 
-### 1. Database
+### 1. Supabase schema (expected by the agents)
 
-Open Supabase → **SQL Editor** → **New query** → paste `Backend/database/schema.sql` → **Run**. You should see 15 rows in each of `customers`, `orders`, `support_tickets`.
+The app assumes your Supabase project already has the three tables below. `orders.status` **must** include `'returned'` for the Returns service to work. If you ever need to re-create the tables, the DDL the project was designed against is:
+
+```sql
+CREATE TABLE customers (
+  id BIGSERIAL PRIMARY KEY,
+  full_name TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE,
+  phone TEXT, address TEXT, city TEXT, country TEXT,
+  loyalty_tier TEXT NOT NULL DEFAULT 'standard'
+    CHECK (loyalty_tier IN ('standard','silver','gold','platinum')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE orders (
+  id BIGSERIAL PRIMARY KEY,
+  customer_id BIGINT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  product_name TEXT NOT NULL,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit_price NUMERIC(10,2) NOT NULL CHECK (unit_price >= 0),
+  total_amount NUMERIC(10,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending','processing','shipped','delivered','cancelled','returned')),
+  order_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  tracking_number TEXT
+);
+
+CREATE TABLE support_tickets (
+  id BIGSERIAL PRIMARY KEY,
+  customer_id BIGINT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  order_id BIGINT REFERENCES orders(id) ON DELETE SET NULL,
+  subject TEXT NOT NULL, description TEXT NOT NULL,
+  category TEXT NOT NULL
+    CHECK (category IN ('billing','shipping','product','technical','refund','general')),
+  priority TEXT NOT NULL DEFAULT 'medium'
+    CHECK (priority IN ('low','medium','high','urgent')),
+  status TEXT NOT NULL DEFAULT 'open'
+    CHECK (status IN ('open','in_progress','waiting_customer','resolved','closed')),
+  assigned_agent TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
 
 ### 2. Python environment
 
@@ -196,57 +247,56 @@ SUPABASE_PROJECT_REF=your-project-ref
 
 ## Running
 
-Three modes. All assume you're in `Backend/` with the venv active (or use the absolute path `C:\Users\dmadura\.venvs\cs-agents\Scripts\...`).
+The app has **three** processes. Open three terminals; all assume the venv is on `PATH` (or use `C:\Users\dmadura\.venvs\cs-agents\Scripts\...`).
 
-### A — End-to-end scenarios (recommended)
-
-Exercises **billing (MCP)**, **returns (A2A)**, and **escalation** in one command. Auto-starts and stops the A2A service.
+### A — Full stack (UI + ADK API + A2A service)
 
 ```powershell
-cd Backend
-python -m tests.scenarios
-```
-
-### B — Interactive web UI
-
-Two terminals. The A2A service must be up before `adk web` is used to call the Returns specialist.
-
-```powershell
-# Terminal A  — keep running
+# Terminal 1 — returns A2A service (keep running)
 cd Backend
 python -m returns_service.server                  # http://127.0.0.1:8001
 
-# Terminal B
+# Terminal 2 — ADK HTTP API (keep running)
 cd Backend
-adk web                                           # http://localhost:8000
+adk api_server                                    # http://127.0.0.1:8000
+
+# Terminal 3 — React dev server
+cd Frontend
+npm install                                       # first time only
+npm run dev                                       # http://localhost:5173
 ```
 
-Pick **customer_support** in the agent dropdown.
+Open [http://localhost:5173](http://localhost:5173). Pick a suggestion or type your own question. The right-hand **Agent trace** panel shows `transfer`, `tool_call`, and `tool_result` events live.
 
-### C — CLI or HTTP API
+### B — Backend only (no UI)
 
 ```powershell
+# Terminal 1 — returns A2A service (keep running)
 cd Backend
-python -m returns_service.server                  # Terminal A, keep running
+python -m returns_service.server
 
+# Terminal 2 — one of:
+cd Backend
+adk web                                           # built-in dev UI at http://localhost:8000
+#   or
 adk run customer_support                          # terminal chat
-# or
-adk api_server                                    # HTTP API (for the Frontend in Step 5)
 ```
 
 ---
 
-## Scenarios & what they prove
+## What to try in the UI
 
-| # | Scenario | Typed prompt | Route | Evidence |
-|---|----------|--------------|-------|----------|
-| 1 | **Billing (MCP)** | `I was charged for order #8 though I cancelled. Email: henry.walker@example.com` | router → `ticket_agent` → MCP | Two `execute_sql` calls visible in the event stream; ticket #8 (billing/urgent) surfaced. |
-| 2 | **Returns (A2A)** | `I want to return order #7 — speaker battery lasts 2 hours. Email: grace.chen@example.com` | router → `returns_agent` (remote) | Real INSERT into `support_tickets` + UPDATE on `orders.status='returned'`. |
-| 3 | **Escalation** | After an out-of-window return: `Please escalate to a human` | router → `returns_agent` (reject) → router → `ticket_agent` | Multi-hop hand-off; related technical ticket surfaced via MCP. |
+| Prompt | Expected route | Evidence |
+|--------|----------------|----------|
+| `Where is order #10? When will it arrive?` | router → `order_agent` → MCP | `transfer` + `execute_sql` rows in trace; `order_agent` replies with status + tracking. |
+| `I was charged for order #8 though I cancelled. Email: henry.walker@example.com` | router → `ticket_agent` → MCP | Two `execute_sql` calls; billing ticket #8 (urgent) surfaced. |
+| `I want to return order #7 — speaker battery lasts 2 hours. Email: grace.chen@example.com` | router → `returns_agent` (remote) | Trace shows the A2A transfer; Supabase now has a new `refund` ticket and `orders.id=7` flipped to `returned`. |
+| After an out-of-window return: `Please escalate to a human` | router → `returns_agent` (reject) → router → `ticket_agent` | Multi-hop hand-off visible; related technical ticket surfaced via MCP. |
+| `What is your return policy?` | router → `faq_agent` | Plain-text reply, no tool calls. |
 
-> **Scenario 2 mutates Supabase.** The second run shows the idempotency guard instead of a fresh INSERT — re-apply `schema.sql` to reset.
+> **Returns mutate Supabase.** A second return for the same `order_id` will be refused by the idempotency guard instead of creating a duplicate — that's the intended behaviour, and it's enforced in `check_return_eligibility`.
 
-> **Remote tool calls are invisible locally.** By A2A design the local stream sees remote *messages*, not the remote process's internal function-call events. Proof of tool execution lives in the database.
+> **Remote tool calls are invisible locally.** By A2A design the local stream sees remote *messages*, not the remote process's internal function-call events. Proof of tool execution for the Returns agent lives in the Supabase row itself.
 
 ---
 
@@ -278,15 +328,15 @@ adk api_server                                    # HTTP API (for the Frontend i
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| **Connection refused from `returns_agent`** | A2A service not running | Start `python -m returns_service.server`, or use **Mode A** which auto-starts it. |
-| **`Already returned`** every run | Scenario 2 previously ran | Re-apply `Backend/database/schema.sql` in Supabase. |
+| **Connection refused from `returns_agent`** | A2A service not running | Start `python -m returns_service.server` in Terminal 1. |
+| **Frontend stuck on `no session`** | `adk api_server` not running | Start it in Terminal 2 on port 8000. |
+| **`Already returned`** on a return request | Order was already returned in a prior test | In Supabase, `UPDATE orders SET status = 'delivered' WHERE id = <n>;` to re-arm that order. |
 | **`npx` hangs on first MCP call** | First-run download of `@supabase/mcp-server-supabase` | Wait (~20 MB) or pre-cache: `npx -y @supabase/mcp-server-supabase@latest --help`. |
 | **`ModuleNotFoundError: a2a.server.apps`** | `a2a-sdk` 1.0.x installed | Pin `a2a-sdk==0.3.26` (already in `requirements.txt`). |
 | **`OSError: filename too long` on install** | Windows 260-char path limit | Create the venv **outside** the project (see Local setup § 2). |
 | **Port 8000 in use** | Another `adk web` or app | `adk web --port 8080`. |
 | **Port 8001 in use** | Another returns service | Set `RETURNS_SERVICE_PORT` and `RETURNS_AGENT_URL`, then restart both processes. |
 | **401 from Supabase Management API** | Wrong token kind | `SUPABASE_ACCESS_TOKEN` must be a *personal* access token (`sbp_...`), not anon / service-role. |
-| **Schema errors on re-run** | Tables already exist | `schema.sql` begins with `DROP TABLE ... CASCADE`; safe to re-run in dev. |
 
 ---
 
@@ -322,17 +372,41 @@ Returns `{ success, ticket_id?, order_id?, message?, reason? }`.
 
 ---
 
-## Frontend (Step 5) — placeholder
+## Frontend internals
 
-Planned as a **Streamlit** chat UI that talks to `adk api_server` (create session → stream `run_sse`) so sub-agent transfers are visible in the UI. Once implemented it will live under `Frontend/` and launch with:
+A deliberately tiny **React + TypeScript + Vite** chat UI under `Frontend/`. Two production deps (`react`, `react-dom`), zero UI libraries. Talks to `adk api_server` over its SSE endpoint so the user sees **sub-agent transfers** and **tool calls** live in a side-panel trace. Run it with **Mode A** above.
+
+| File | Role |
+|------|------|
+| `Frontend/src/App.tsx` | Chat layout, message + trace state, suggestion buttons, abort / reset. |
+| `Frontend/src/api.ts` | Thin ADK client: `POST /apps/.../sessions/<id>` + streamed `POST /run_sse`. |
+| `Frontend/src/types.ts` | Minimal shapes for ADK events and UI state. |
+| `Frontend/src/styles.css` | Dark theme, two-pane layout (chat + trace), responsive. |
+| `Frontend/vite.config.ts` | Dev proxy `/api/adk` → `http://127.0.0.1:8000`. |
+
+### Build-time environment (optional)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VITE_ADK_API_BASE_URL` | `/api/adk` (uses Vite proxy) | Point at a deployed ADK API instead of the dev proxy. |
+| `VITE_ADK_APP_NAME` | `customer_support` | ADK app name that `adk api_server` exposes. |
+
+### Production build
 
 ```powershell
 cd Frontend
-streamlit run app.py
+npm run build
+npm run preview
 ```
+
+Output lands in `Frontend/dist/` (~150 kB raw / ~48 kB gzipped).
 
 ---
 
 ## License
 
-Educational project for the AI Engineering Bootcamp, Assignment 3. MCP & A2A integrations use Google ADK and `@supabase/mcp-server-supabase` under their respective licenses.
+This project is released under the **MIT License**. See the [`LICENSE`](./LICENSE) file in the repository root for the full text.
+
+Copyright © 2026 Dulip Madurasinghe.
+
+Third-party components keep their own licenses — in particular, this project depends on [Google ADK](https://github.com/google/adk-python), [`a2a-sdk`](https://pypi.org/project/a2a-sdk/), [LiteLLM](https://github.com/BerriAI/litellm), and [`@supabase/mcp-server-supabase`](https://github.com/supabase-community/supabase-mcp); refer to those projects for their license terms.
